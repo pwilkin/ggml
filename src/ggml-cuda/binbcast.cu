@@ -34,7 +34,7 @@ template <float (*bin_op)(const float, const float),
 static __global__ void k_bin_bcast(const src0_t *         src0,
                                    const src1_t *         src1,
                                    dst_t *                dst,
-                                   const int              ne0,
+                                   const int64_t          ne0,
                                    const int              ne1,
                                    const int              ne2,
                                    const uint3            ne3,
@@ -61,7 +61,7 @@ static __global__ void k_bin_bcast(const src0_t *         src0,
     const uint32_t i2  = fastdiv((blockDim.z * blockIdx.z + threadIdx.z), ne3);
     const uint32_t i3  = (blockDim.z * blockIdx.z + threadIdx.z) - (i2 * ne3.z);
 
-    if (i0s >= (uint32_t)ne0 || i1 >= (uint32_t)ne1 || i2 >= (uint32_t)ne2 || i3 >= ne3.z) {
+    if ((int64_t)i0s >= ne0 || i1 >= (uint32_t)ne1 || i2 >= (uint32_t)ne2 || i3 >= ne3.z) {
         return;
     }
 
@@ -77,8 +77,8 @@ static __global__ void k_bin_bcast(const src0_t *         src0,
     dst_t * dst_row = dst + i_dst;
 
     ggml_cuda_pdl_sync();
-    for (int i0 = i0s; i0 < ne0; i0 += blockDim.x * gridDim.x) {
-        const uint32_t i10 = fastmodulo(i0, ne10);
+    for (int64_t i0 = i0s; i0 < ne0; i0 += blockDim.x * gridDim.x) {
+        const uint32_t i10 = fastmodulo((uint32_t)i0, ne10);
 
         float result = src0_row ? (float) src0_row[i0*s00] : 0.0f;
         if constexpr (sizeof...(src1_ptrs) > 0) {
@@ -122,7 +122,7 @@ static __global__ void k_bin_bcast_unravel(const src0_t *         src0,
                                            const int              s12,
                                            const int              s13,
                                            src1_ptrs... src1s) {
-    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+    const uint32_t i = blockDim.x*blockIdx.x + threadIdx.x;   // flat index over ne0*ne1*ne2*ne3 (up to 2^32; int overflowed at 2^31)
 
     const uint32_t i3 = fastdiv(i, prod_012);
     const uint32_t i2 = fastdiv(i - i3 * prod_012.z, prod_01);
