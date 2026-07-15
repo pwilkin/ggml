@@ -918,8 +918,10 @@ static __device__ __forceinline__ uint32_t fastdiv(uint32_t n, const uint3 fastd
     // fastdiv_values.z is unused and optimized away by the compiler.
     // Compute high 32 bits of n * mp
     const uint32_t hi = __umulhi(n, fastdiv_values.x);
-    // add n, apply bit shift
-    return (hi + n) >> fastdiv_values.y;
+    // add n, apply bit shift. 64-bit intermediate is required: (hi + n) needs 33 bits,
+    // and L == 32 for divisors > 2^31 (a 32-bit >> 32 is UB and shifts by 0 on-device,
+    // yielding a garbage quotient -> out-of-bounds indices).
+    return (uint32_t)(((uint64_t) hi + n) >> fastdiv_values.y);
 }
 
 static __device__ __forceinline__ uint32_t fastmodulo(uint32_t n, const uint3 fastdiv_values) {
