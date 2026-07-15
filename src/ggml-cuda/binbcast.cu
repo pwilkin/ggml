@@ -91,6 +91,78 @@ static __global__ void k_bin_bcast(const src0_t *         src0,
     }
 }
 
+// 64-bit unravel. The uint32 fast path below cannot address past 2^32 elements: its flat
+// index wraps, the prod_01/prod_012 fastdiv values are built from a truncated (uint32_t)
+// cast, and i_src0 = i1*s01 (uint32 * int) overflows at 4.29G on its own. The failure is
+// SILENT -- the tail is simply never written, so dst keeps whatever was there. Route
+// oversized tensors here instead. Plain 64-bit divides rather than fastdiv: this path is
+// rare (a res-1024 decode's [4096, >1M] intermediates) and correctness beats a few cycles.
+template <float (*bin_op)(const float, const float),
+          typename src0_t,
+          typename src1_t,
+          typename dst_t,
+          typename... src1_ptrs>
+static __global__ void k_bin_bcast_unravel_64(const src0_t * src0,
+                                              const src1_t * src1,
+                                              dst_t *        dst,
+                                              const int64_t  ne0,
+                                              const int64_t  ne1,
+                                              const int64_t  ne2,
+                                              const int64_t  ne3,
+                                              const int64_t  ne10,
+                                              const int64_t  ne11,
+                                              const int64_t  ne12,
+                                              const int64_t  ne13,
+                                              const int64_t  s1,
+                                              const int64_t  s2,
+                                              const int64_t  s3,
+                                              const int64_t  s00,
+                                              const int64_t  s01,
+                                              const int64_t  s02,
+                                              const int64_t  s03,
+                                              const int64_t  s10,
+                                              const int64_t  s11,
+                                              const int64_t  s12,
+                                              const int64_t  s13,
+                                              const int64_t  ne_total,
+                                              src1_ptrs... src1s) {
+    const int64_t prod_01  = ne0 * ne1;
+    const int64_t prod_012 = prod_01 * ne2;
+    // grid-stride: ne_total/block_size can exceed the grid-x limit on its own
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+         i < ne_total;
+         i += (int64_t) gridDim.x * blockDim.x) {
+        const int64_t i3 = i / prod_012;
+        const int64_t r3 = i - i3 * prod_012;
+        const int64_t i2 = r3 / prod_01;
+        const int64_t r2 = r3 - i2 * prod_01;
+        const int64_t i1 = r2 / ne0;
+        const int64_t i0 = r2 - i1 * ne0;
+
+        const int64_t i11 = i1 % ne11;
+        const int64_t i12 = i2 % ne12;
+        const int64_t i13 = i3 % ne13;
+
+        const int64_t i_src0 =  i3*s03 +  i2*s02 +  i1*s01;
+        const int64_t i_src1 = i13*s13 + i12*s12 + i11*s11;
+        const int64_t i_dst  =  i3*s3  +  i2*s2  +  i1*s1;
+
+        const src0_t * src0_row = src0 ? (src0 + i_src0) : nullptr;
+        dst_t * dst_row = dst + i_dst;
+
+        const int64_t i10 = i0 % ne10;
+
+        float result = src0_row ? (float) src0_row[i0*s00] : 0.0f;
+        if constexpr (sizeof...(src1_ptrs) > 0) {
+            result = (..., (result = bin_op(result, (float) src1s[i_src1 + i10*s10])));
+        } else {
+            result = bin_op(result, (float) src1[i_src1 + i10*s10]);
+        }
+
+        dst_row[i0] = (dst_t) result;
+    }
+}
+
 template <float (*bin_op)(const float, const float),
           typename src0_t,
           typename src1_t,
@@ -281,6 +353,32 @@ static void launch_bin_bcast_pack(const ggml_tensor * src0, const ggml_tensor * 
         const uint3 ne13 = init_fastdiv_values((uint32_t) cne1[3]);
 
         if (block_nums.z > 65535 || block_nums.y > 65535) {
+            // The uint32 unravel below tops out at 2^32 elements, and its uint32*int
+            // offsets (i1*s01 etc.) wrap even earlier. Both fail silently, so check the
+            // element count AND the largest offset any thread will form.
+            const int64_t ne_total = ne0 * ne1 * ne2 * ne3;
+            const int64_t max_off_src0 = (ne3-1)*(int64_t)s03 + (ne2-1)*(int64_t)s02 +
+                                         (ne1-1)*(int64_t)s01 + (ne0-1)*(int64_t)s00;
+            const int64_t max_off_dst  = (ne3-1)*(int64_t)s3  + (ne2-1)*(int64_t)s2  +
+                                         (ne1-1)*(int64_t)s1  + (ne0-1);
+            const int64_t u32max = (int64_t) 0xFFFFFFFFll;
+            if (ne_total > u32max || max_off_src0 > u32max || max_off_dst > u32max) {
+                const int64_t want    = (ne_total + block_size - 1) / block_size;
+                const int64_t nblocks = want < 65535 ? want : 65535;   // grid-stride covers the rest
+                const ggml_cuda_kernel_launch_params launch_params =
+                    ggml_cuda_kernel_launch_params((dim3) (uint32_t) nblocks, block_size, 0, stream);
+                ggml_cuda_kernel_launch(
+                    k_bin_bcast_unravel_64<bin_op, src0_t, src1_t, dst_t, type_for_index<const src1_t *, I>...>,
+                    launch_params, src0_dd, src1_dd, dst_dd,
+                    (int64_t) ne0, (int64_t) ne1, (int64_t) ne2, (int64_t) ne3,
+                    (int64_t) cne1[0], (int64_t) cne1[1], (int64_t) cne1[2], (int64_t) cne1[3],
+                    (int64_t) s1, (int64_t) s2, (int64_t) s3,
+                    (int64_t) s00, (int64_t) s01, (int64_t) s02, (int64_t) s03,
+                    (int64_t) s10, (int64_t) s11, (int64_t) s12, (int64_t) s13,
+                    ne_total, (const src1_t *) dst->src[I + 1]->data...);
+                return;
+            }
+
             int         block_num  = (ne0 * ne1 * ne2 * ne3 + block_size - 1) / block_size;
             const uint3 prod_012    = init_fastdiv_values((uint32_t) (ne0 * ne1 * ne2));
             const uint3 prod_01     = init_fastdiv_values((uint32_t) (ne0 * ne1));
