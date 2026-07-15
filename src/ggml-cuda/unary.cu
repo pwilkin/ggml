@@ -115,9 +115,9 @@ static __device__ __forceinline__ float op_trunc(float x) {
 }
 
 template <float (*op)(float), typename T>
-static __global__ void unary_op_kernel(const T * x, T * dst, const int k) {
+static __global__ void unary_op_kernel(const T * x, T * dst, const int64_t k) {
     ggml_cuda_pdl_lc();
-    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+    const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
 
     if (i >= k) {
         return;
@@ -128,8 +128,8 @@ static __global__ void unary_op_kernel(const T * x, T * dst, const int k) {
 }
 
 template <float (*op)(float), typename T>
-static void unary_cuda(const T * x, T * dst, const int k, cudaStream_t stream) {
-    const int num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+static void unary_cuda(const T * x, T * dst, const int64_t k, cudaStream_t stream) {
+    const int64_t num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream);
     ggml_cuda_kernel_launch(unary_op_kernel<op, T>, launch_params, x, dst, k);
 }
