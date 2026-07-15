@@ -864,23 +864,53 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
 #if defined(TURING_MMA_AVAILABLE)
         if constexpr (cols_per_warp == 8) {
-            const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[0], KQ_max_scale[cols_per_thread - 1]);
+            // Row-major C tile: I is DV, J is the KQ column. A half2 element covers the two columns
+            // KQ_max_scale[0] and [cols_per_thread-1]; in the FP32 tile those are l % 2 == 0 / 1,
+            // because tile<16, 8, float>::get_j(l) == 2*(threadIdx.x % 4) + l % 2.
+            static_assert(cols_per_thread == 2, "assumed by the KQ column indexing below");
+            if constexpr (std::is_same_v<decltype(T_C_VKQ::x), half2[T_C_VKQ::ne]>) {
+                const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[0], KQ_max_scale[cols_per_thread - 1]);
 #pragma unroll
-            for (int i = 0; i < DV/T_C_VKQ::I; ++i) {
+                for (int i = 0; i < DV/T_C_VKQ::I; ++i) {
 #pragma unroll
-                for (int l = 0; l < T_C_VKQ::ne; ++l) {
-                    VKQ_C[i].x[l] *= KQ_max_scale_h2;
+                    for (int l = 0; l < T_C_VKQ::ne; ++l) {
+                        VKQ_C[i].x[l] *= KQ_max_scale_h2;
+                    }
+                }
+            } else {
+                static_assert(std::is_same_v<decltype(T_C_VKQ::x), float[T_C_VKQ::ne]>, "bad VKQ type");
+#pragma unroll
+                for (int i = 0; i < DV/T_C_VKQ::I; ++i) {
+#pragma unroll
+                    for (int l = 0; l < T_C_VKQ::ne; ++l) {
+                        VKQ_C[i].x[l] *= KQ_max_scale[(l % 2) * (cols_per_thread - 1)];
+                    }
                 }
             }
         } else {
+            // Column-major C tile: I is the KQ column, J is DV. The scale depends only on the KQ
+            // column, i.e. on the tile's i. tile<16, 8, half2>::get_i(l) selects it with l % 2,
+            // tile<16, 16, float>::get_i(l) with (l / 2) % 2; both agree with T_C_KQ::get_i(2*col).
+            static_assert(cols_per_thread == 2, "assumed by the KQ column indexing below");
+            if constexpr (std::is_same_v<decltype(T_C_VKQ::x), half2[T_C_VKQ::ne]>) {
 #pragma unroll
-            for (int col = 0; col < cols_per_thread; ++col) {
-                const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[col], KQ_max_scale[col]);
+                for (int col = 0; col < cols_per_thread; ++col) {
+                    const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[col], KQ_max_scale[col]);
 #pragma unroll
-                for (int i = 0; i < (DV/2)/T_C_VKQ::J; ++i) {
+                    for (int i = 0; i < (DV/2)/T_C_VKQ::J; ++i) {
 #pragma unroll
-                    for (int l0 = 0; l0 < T_C_VKQ::ne; l0 += 2) {
-                        VKQ_C[i].x[l0 + col] *= KQ_max_scale_h2;
+                        for (int l0 = 0; l0 < T_C_VKQ::ne; l0 += 2) {
+                            VKQ_C[i].x[l0 + col] *= KQ_max_scale_h2;
+                        }
+                    }
+                }
+            } else {
+                static_assert(std::is_same_v<decltype(T_C_VKQ::x), float[T_C_VKQ::ne]>, "bad VKQ type");
+#pragma unroll
+                for (int i = 0; i < DV/T_C_VKQ::J; ++i) {
+#pragma unroll
+                    for (int l = 0; l < T_C_VKQ::ne; ++l) {
+                        VKQ_C[i].x[l] *= KQ_max_scale[(l / 2) % 2];
                     }
                 }
             }
@@ -1026,12 +1056,19 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
 // acc_f32 == accumulate VKQ in FP32 (GGML_PREC_F32) instead of FP16.
 //
-// Only the arches whose kernel body already implements an FP32 VKQ accumulator can honour this:
-// AMD WMMA (RDNA3/RDNA4) and AMD MFMA (CDNA) both use it today for DV == 80 / 112, so every
-// VKQ_C site there is already written against `if constexpr (is half2) ... else ... float`.
-// On Turing/Ampere and Volta the VKQ_C rescale and sink paths are hard-coded to half2, so those
-// arches ignore acc_f32 here -- see ggml_cuda_fattn_mma_f32_acc_supported(), which keeps the
-// host from silently believing the request was honoured.
+// Only the VKQ accumulator changes; it lives in registers, so an FP32 accumulator costs no extra
+// SRAM and needs no config-table changes. K/V/Q stay staged as FP16 and the mma inputs stay FP16 --
+// an FP16xFP16 product is exact in FP32, so widening only the accumulator removes the stagnation of
+// the running sum without touching the tile budget.
+//
+// Every arch selects the FP32 C tile that is the exact same shape as its FP16 one, measured in
+// scalars: an FP16 C tile holds two values per element in the J direction, an FP32 C tile only one,
+// so tile<I, 2*J, float> covers the same footprint as tile<I, J, half2>. mma() already has the
+// matching f32.f16.f16.f32 overload for each of those shapes.
+//
+// Volta is the one exception: its rescale/sink paths and its m8n8k4 C layout are still hard-coded to
+// half2, so it ignores acc_f32 -- see ggml_cuda_fattn_mma_f32_acc_supported(), which keeps the host
+// from silently believing the request was honoured.
 #if defined(TURING_MMA_AVAILABLE)
 template<int DV, int ncols, bool acc_f32> struct mma_tile_sizes {
     using T_A_KQ  = tile<16,  8, half2>; // row-major
@@ -1039,7 +1076,11 @@ template<int DV, int ncols, bool acc_f32> struct mma_tile_sizes {
     using T_C_KQ  = tile<16, 16, float>; // column-major
     using T_A_VKQ = tile<16,  8, half2>; // row-major
     using T_B_VKQ = tile<16,  8, half2>; // column-major
-    using T_C_VKQ = tile<16,  8, half2>; // column-major
+    // tile<16, 16, float> is the FP32 analogue of tile<16, 8, half2>: same 16x16 scalars, and
+    // mma() has an f32.f16.f16.f32 overload taking exactly these A/B tiles.
+    using T_C_VKQ = std::conditional_t<acc_f32,
+        tile<16, 16, float>,
+        tile<16,  8, half2>>;            // column-major
 };
 template<int DV, bool acc_f32> struct mma_tile_sizes<DV, 8, acc_f32> {
     using T_A_KQ  = tile<16,  8, half2>; // row-major
@@ -1047,7 +1088,11 @@ template<int DV, bool acc_f32> struct mma_tile_sizes<DV, 8, acc_f32> {
     using T_C_KQ  = tile<16,  8, float>; // row-major
     using T_A_VKQ = tile<16,  8, half2>; // row-major
     using T_B_VKQ = tile< 8,  8, half2>; // column-major
-    using T_C_VKQ = tile<16,  4, half2>; // row-major
+    // tile<16, 8, float> is the FP32 analogue of tile<16, 4, half2>, and is the same shape that
+    // T_C_KQ already uses here -- so get_half2() converts it back exactly as it does for KQ.
+    using T_C_VKQ = std::conditional_t<acc_f32,
+        tile<16,  8, float>,
+        tile<16,  4, half2>>;            // row-major
 };
 #elif defined(AMD_WMMA_AVAILABLE)
 #ifdef RDNA3
@@ -1131,8 +1176,9 @@ template<int DV, int ncols, bool acc_f32> struct mma_tile_sizes {
 #endif // defined(TURING_MMA_AVAILABLE)
 
 // True where the MMA kernel body implements an FP32 VKQ accumulator (see mma_tile_sizes).
+// That is everything except Volta, whose m8n8k4 C layout is still FP16-only here.
 static bool ggml_cuda_fattn_mma_f32_acc_supported(const int cc) {
-    return amd_wmma_available(cc) || amd_mfma_available(cc);
+    return turing_mma_available(cc) || amd_wmma_available(cc) || amd_mfma_available(cc);
 }
 
 // `inline` (not `static`) so the once_flag is shared across all translation units.
@@ -1216,7 +1262,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     // FP32 accumulator was reachable only via the DV == 80 / 112 specializations.)
     constexpr bool VKQ_C_is_half2 = std::is_same_v<decltype(T_C_VKQ::x), half2[T_C_VKQ::ne]>;
 #if defined(TURING_MMA_AVAILABLE)
-    T_C_VKQ VKQ_C[cols_per_warp == 8 ? DV/T_C_VKQ::I : DV/(2*T_C_VKQ::J)];
+    // cols_per_warp == 8 keeps DV in the I direction, so the tile count is type-independent there.
+    T_C_VKQ VKQ_C[cols_per_warp == 8 ? DV/T_C_VKQ::I :
+                  (VKQ_C_is_half2   ? DV/(2*T_C_VKQ::J) : DV/T_C_VKQ::J)];
 #elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
     T_C_VKQ VKQ_C[VKQ_C_is_half2     ? DV/(2*T_C_VKQ::J) : DV/T_C_VKQ::J];
 #else // Volta
@@ -1403,23 +1451,53 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
 #if defined(TURING_MMA_AVAILABLE)
         if constexpr (cols_per_warp == 8) {
-            const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[0], KQ_max_scale[cols_per_thread - 1]);
+            // Row-major C tile: I is DV, J is the KQ column. A half2 element covers the two columns
+            // KQ_max_scale[0] and [cols_per_thread-1]; in the FP32 tile those are l % 2 == 0 / 1,
+            // because tile<16, 8, float>::get_j(l) == 2*(threadIdx.x % 4) + l % 2.
+            static_assert(cols_per_thread == 2, "assumed by the KQ column indexing below");
+            if constexpr (std::is_same_v<decltype(T_C_VKQ::x), half2[T_C_VKQ::ne]>) {
+                const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[0], KQ_max_scale[cols_per_thread - 1]);
 #pragma unroll
-            for (int i = 0; i < DV/T_C_VKQ::I; ++i) {
+                for (int i = 0; i < DV/T_C_VKQ::I; ++i) {
 #pragma unroll
-                for (int l = 0; l < T_C_VKQ::ne; ++l) {
-                    VKQ_C[i].x[l] *= KQ_max_scale_h2;
+                    for (int l = 0; l < T_C_VKQ::ne; ++l) {
+                        VKQ_C[i].x[l] *= KQ_max_scale_h2;
+                    }
+                }
+            } else {
+                static_assert(std::is_same_v<decltype(T_C_VKQ::x), float[T_C_VKQ::ne]>, "bad VKQ type");
+#pragma unroll
+                for (int i = 0; i < DV/T_C_VKQ::I; ++i) {
+#pragma unroll
+                    for (int l = 0; l < T_C_VKQ::ne; ++l) {
+                        VKQ_C[i].x[l] *= KQ_max_scale[(l % 2) * (cols_per_thread - 1)];
+                    }
                 }
             }
         } else {
+            // Column-major C tile: I is the KQ column, J is DV. The scale depends only on the KQ
+            // column, i.e. on the tile's i. tile<16, 8, half2>::get_i(l) selects it with l % 2,
+            // tile<16, 16, float>::get_i(l) with (l / 2) % 2; both agree with T_C_KQ::get_i(2*col).
+            static_assert(cols_per_thread == 2, "assumed by the KQ column indexing below");
+            if constexpr (std::is_same_v<decltype(T_C_VKQ::x), half2[T_C_VKQ::ne]>) {
 #pragma unroll
-            for (int col = 0; col < cols_per_thread; ++col) {
-                const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[col], KQ_max_scale[col]);
+                for (int col = 0; col < cols_per_thread; ++col) {
+                    const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[col], KQ_max_scale[col]);
 #pragma unroll
-                for (int i = 0; i < (DV/2)/T_C_VKQ::J; ++i) {
+                    for (int i = 0; i < (DV/2)/T_C_VKQ::J; ++i) {
 #pragma unroll
-                    for (int l0 = 0; l0 < T_C_VKQ::ne; l0 += 2) {
-                        VKQ_C[i].x[l0 + col] *= KQ_max_scale_h2;
+                        for (int l0 = 0; l0 < T_C_VKQ::ne; l0 += 2) {
+                            VKQ_C[i].x[l0 + col] *= KQ_max_scale_h2;
+                        }
+                    }
+                }
+            } else {
+                static_assert(std::is_same_v<decltype(T_C_VKQ::x), float[T_C_VKQ::ne]>, "bad VKQ type");
+#pragma unroll
+                for (int i = 0; i < DV/T_C_VKQ::J; ++i) {
+#pragma unroll
+                    for (int l = 0; l < T_C_VKQ::ne; ++l) {
+                        VKQ_C[i].x[l] *= KQ_max_scale[(l / 2) % 2];
                     }
                 }
             }
@@ -1465,11 +1543,24 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     static_assert((DV/2) % nbatch_combine == 0, "bad nbatch_combine");
 
     if constexpr (cols_per_warp == 8) {
-        const int jc_cwmo = (threadIdx.x % (2*T_C_VKQ::J)) / T_C_VKQ::J; // jc combine write meta offset
-        const int jc_cwm = threadIdx.y*(2*T_C_VKQ::J) + 2*T_C_VKQ::get_j(-1) + jc_cwmo; // jc combine write meta
+        // The C tile's J direction is the KQ column, and the scalar column count is cols_per_warp
+        // for both element types (a half2 covers two columns, a float one). Spelling the strides as
+        // cols_per_warp instead of 2*T_C_VKQ::J therefore keeps the FP16 path bit-identical --
+        // 2*T_C_VKQ::J == 8 == cols_per_warp for tile<16, 4, half2> -- while staying correct for
+        // tile<16, 8, float>, where 2*T_C_VKQ::J would be 16 and overrun the meta row.
+        const int jc_cwmo = (threadIdx.x % cols_per_warp) / (cols_per_warp/2); // jc combine write meta offset
+        // First scalar KQ column of this thread. The half2 tile's get_j ignores l (hence the
+        // historical get_j(-1)); the float tile encodes the column parity in l, so ask for l == 0.
+        int jc_cwm_col0;
+        if constexpr (VKQ_C_is_half2) {
+            jc_cwm_col0 = 2*T_C_VKQ::get_j(-1);
+        } else {
+            jc_cwm_col0 = T_C_VKQ::get_j(0);
+        }
+        const int jc_cwm = threadIdx.y*cols_per_warp + jc_cwm_col0 + jc_cwmo; // jc combine write meta
         const float2 KQ_cmr = make_float2(KQ_max[jc_cwmo], KQ_rowsum[jc_cwmo]); // KQ combine max rowsum
 
-        if (((!needs_fixup && !is_fixup) || np > 1) && threadIdx.x < 2*T_C_VKQ::J) {
+        if (((!needs_fixup && !is_fixup) || np > 1) && threadIdx.x < cols_per_warp) {
             // Use the 16 bytes of padding in each row to store the meta data: KQ max, KQ rowsum, KQ max scale.
             ((float2 *) tile_Q)[jc_cwm*(tile_stride/2) + nbatch_combine/2] = KQ_cmr;
         }
@@ -1492,7 +1583,17 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         // KQ_cmr = KQ combine max rowsum
         // Use the 16 bytes of padding in each Q column to store the meta data: KQ max, KQ rowsum, KQ max scale.
 #if defined(TURING_MMA_AVAILABLE)
-        const int jc_cwm = threadIdx.y*cols_per_warp + T_C_VKQ::get_i(threadIdx.x % 4);
+        // get_i maps an element index to its KQ column: the half2 tile selects the column with
+        // l % 2, the float tile with (l / 2) % 2. So the float tile must be asked for 2*col --
+        // exactly as the sink path does with T_C_KQ, which is always float.
+        const int jc_cwm_col = threadIdx.x % 4;
+        int jc_cwm_i;
+        if constexpr (VKQ_C_is_half2) {
+            jc_cwm_i = T_C_VKQ::get_i(jc_cwm_col);
+        } else {
+            jc_cwm_i = T_C_VKQ::get_i(2*jc_cwm_col);
+        }
+        const int jc_cwm = threadIdx.y*cols_per_warp + jc_cwm_i;
         const float2 KQ_cmr = make_float2(KQ_max[threadIdx.x % cols_per_thread], KQ_rowsum[threadIdx.x % cols_per_thread]);
         const bool thread_should_write = threadIdx.x % 4 < cols_per_thread;
 #elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
@@ -1600,11 +1701,21 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 #pragma unroll
     for (int k00 = 0; k00 < DV/2; k00 += nbatch_combine) {
         if constexpr (cols_per_warp == 8) {
-            static_assert(std::is_same_v<decltype(T_C_VKQ::x), half2[T_C_VKQ::ne]>, "bad VKQ type");
             const int jc_cwd = threadIdx.y*T_B_KQ::I + T_B_KQ::get_i(-1); // jc combine write data
 #pragma unroll
             for (int k1 = 0; k1 < nbatch_combine; k1 += T_B_KQ::J) {
-                const T_B_KQ B = get_transposed(VKQ_C[(k00 + k1)/T_B_KQ::J]); // Conversion of C to B matrix puts it in column-major format.
+                // Conversion of C to B matrix puts it in column-major format. The transposition is
+                // FP16-only (movmatrix), so an FP32 accumulator is narrowed first -- exactly as the
+                // KQ path does via get_transposed(get_half2(KQ_C[k])). The destination tile_Q is
+                // half2 regardless, so this store loses no precision the FP16 path would have kept;
+                // the accumulation itself has already happened in FP32, which is the point.
+                T_B_KQ B;
+                if constexpr (std::is_same_v<decltype(T_C_VKQ::x), half2[T_C_VKQ::ne]>) {
+                    B = get_transposed(VKQ_C[(k00 + k1)/T_B_KQ::J]);
+                } else {
+                    static_assert(std::is_same_v<decltype(T_C_VKQ::x), float[T_C_VKQ::ne]>, "bad VKQ type");
+                    B = get_transposed(get_half2(VKQ_C[(k00 + k1)/T_B_KQ::J]));
+                }
 
 #pragma unroll
                 for (int l = 0; l < T_B_KQ::ne; ++l) {
@@ -1778,15 +1889,15 @@ static __global__ void flash_attn_ext_f16(
         NO_DEVICE_CODE;
         return;
     }
-#if !defined(AMD_WMMA_AVAILABLE) && !defined(AMD_MFMA_AVAILABLE)
-    // Only AMD WMMA/MFMA implement an FP32 VKQ accumulator (see mma_tile_sizes). Elsewhere the
-    // acc_f32 instantiation would be a byte-for-byte duplicate of the FP16 one, and the host never
-    // launches it (ggml_cuda_fattn_mma_f32_acc_supported), so don't emit it at all.
+#if !defined(AMD_WMMA_AVAILABLE) && !defined(AMD_MFMA_AVAILABLE) && !defined(TURING_MMA_AVAILABLE)
+    // Volta is the only arch left whose VKQ_C rescale/sink paths are FP16-only (see mma_tile_sizes),
+    // so there the acc_f32 instantiation would be a byte-for-byte duplicate of the FP16 one and the
+    // host never launches it (ggml_cuda_fattn_mma_f32_acc_supported); don't emit it at all.
     if (acc_f32) {
         NO_DEVICE_CODE;
         return;
     }
-#endif // !defined(AMD_WMMA_AVAILABLE) && !defined(AMD_MFMA_AVAILABLE)
+#endif // !defined(AMD_WMMA_AVAILABLE) && !defined(AMD_MFMA_AVAILABLE) && !defined(TURING_MMA_AVAILABLE)
 #ifdef VOLTA_MMA_AVAILABLE
     if (ncols1*ncols2 < 32) {
         NO_DEVICE_CODE;
@@ -1993,10 +2104,16 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
             : flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, false>;
 
 #if !defined(GGML_USE_MUSA)
-        static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
-        if (!shared_memory_limit_raised[id]) {
+        // cudaFuncSetAttribute applies per kernel *function*, and acc_f32 now selects between two
+        // distinct instantiations, so the two must be tracked independently. With a single flag,
+        // whichever variant launched first would raise only its own limit and leave the other
+        // capped at the 48 kB default -- an out-of-bounds __shared__ write for every shape whose
+        // nbytes_shared_total exceeds it. (Benign before: acc_f32 was never true here, so only one
+        // variant was ever launched.)
+        static bool shared_memory_limit_raised[2][GGML_CUDA_MAX_DEVICES] = {};
+        if (!shared_memory_limit_raised[acc_f32][id]) {
             CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
-            shared_memory_limit_raised[id] = true;
+            shared_memory_limit_raised[acc_f32][id] = true;
         }
 #endif // !defined(GGML_USE_MUSA)
     } else {
@@ -2006,10 +2123,16 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
             : flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, false>;
 
 #if !defined(GGML_USE_MUSA)
-        static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
-        if (!shared_memory_limit_raised[id]) {
+        // cudaFuncSetAttribute applies per kernel *function*, and acc_f32 now selects between two
+        // distinct instantiations, so the two must be tracked independently. With a single flag,
+        // whichever variant launched first would raise only its own limit and leave the other
+        // capped at the 48 kB default -- an out-of-bounds __shared__ write for every shape whose
+        // nbytes_shared_total exceeds it. (Benign before: acc_f32 was never true here, so only one
+        // variant was ever launched.)
+        static bool shared_memory_limit_raised[2][GGML_CUDA_MAX_DEVICES] = {};
+        if (!shared_memory_limit_raised[acc_f32][id]) {
             CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
-            shared_memory_limit_raised[id] = true;
+            shared_memory_limit_raised[acc_f32][id] = true;
         }
 #endif // !defined(GGML_USE_MUSA)
     }
