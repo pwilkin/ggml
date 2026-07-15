@@ -1,4 +1,13 @@
 #include "common.cuh"
+
+// TRELLIS: the tile kernel accumulates VKQ in half2 whenever FAST_FP16_AVAILABLE (always on
+// HIP), and -- unlike the WMMA kernel -- it never reads ggml_flash_attn_ext_get_prec, so
+// GGML_PREC_F32 is silently ignored. Summing ~15k weighted V terms in F16 stagnates: once the
+// running sum is large, small addends round away, biasing the result low, and the error grows
+// with the KV tile count. The F32 path below already exists; this makes it reachable.
+#ifdef GGML_FA_TILE_FORCE_F32
+#undef FAST_FP16_AVAILABLE
+#endif
 #include "fattn-common.cuh"
 #include "fattn-wmma-f16.cuh"
 

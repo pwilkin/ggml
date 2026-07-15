@@ -574,7 +574,20 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    const int best_k = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+    if (getenv("GGML_FA_DEBUG")) {
+        const char * kname = best_k == BEST_FATTN_KERNEL_TILE ? "TILE"
+                           : best_k == BEST_FATTN_KERNEL_VEC  ? "VEC"
+                           : best_k == BEST_FATTN_KERNEL_WMMA_F16 ? "WMMA_F16"
+                           : best_k == BEST_FATTN_KERNEL_MMA_F16  ? "MMA_F16" : "NONE";
+        const ggml_tensor * Q = dst->src[0], * K = dst->src[1], * V = dst->src[2];
+        fprintf(stderr, "[fa] kernel=%s prec=%s Q=[%lld,%lld,%lld] K=[%lld,%lld,%lld] Ktype=%s Vtype=%s mask=%s\n",
+                kname, ggml_flash_attn_ext_get_prec(dst) == GGML_PREC_F32 ? "F32" : "DEFAULT",
+                (long long)Q->ne[0], (long long)Q->ne[1], (long long)Q->ne[2],
+                (long long)K->ne[0], (long long)K->ne[1], (long long)K->ne[2],
+                ggml_type_name(K->type), ggml_type_name(V->type), dst->src[3] ? "yes" : "no");
+    }
+    switch (best_k) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
