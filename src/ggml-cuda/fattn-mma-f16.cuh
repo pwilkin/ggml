@@ -1024,8 +1024,16 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }
 
+// acc_f32 == accumulate VKQ in FP32 (GGML_PREC_F32) instead of FP16.
+//
+// Only the arches whose kernel body already implements an FP32 VKQ accumulator can honour this:
+// AMD WMMA (RDNA3/RDNA4) and AMD MFMA (CDNA) both use it today for DV == 80 / 112, so every
+// VKQ_C site there is already written against `if constexpr (is half2) ... else ... float`.
+// On Turing/Ampere and Volta the VKQ_C rescale and sink paths are hard-coded to half2, so those
+// arches ignore acc_f32 here -- see ggml_cuda_fattn_mma_f32_acc_supported(), which keeps the
+// host from silently believing the request was honoured.
 #if defined(TURING_MMA_AVAILABLE)
-template<int DV, int ncols> struct mma_tile_sizes {
+template<int DV, int ncols, bool acc_f32> struct mma_tile_sizes {
     using T_A_KQ  = tile<16,  8, half2>; // row-major
     using T_B_KQ  = tile<16,  8, half2>; // column-major
     using T_C_KQ  = tile<16, 16, float>; // column-major
@@ -1033,7 +1041,7 @@ template<int DV, int ncols> struct mma_tile_sizes {
     using T_B_VKQ = tile<16,  8, half2>; // column-major
     using T_C_VKQ = tile<16,  8, half2>; // column-major
 };
-template<int DV> struct mma_tile_sizes<DV, 8> {
+template<int DV, bool acc_f32> struct mma_tile_sizes<DV, 8, acc_f32> {
     using T_A_KQ  = tile<16,  8, half2>; // row-major
     using T_B_KQ  = tile< 8,  8, half2>; // column-major
     using T_C_KQ  = tile<16,  8, float>; // row-major
@@ -1043,67 +1051,76 @@ template<int DV> struct mma_tile_sizes<DV, 8> {
 };
 #elif defined(AMD_WMMA_AVAILABLE)
 #ifdef RDNA3
-template<int DV, int ncols> struct mma_tile_sizes {
+template<int DV, int ncols, bool acc_f32> struct mma_tile_sizes {
     using T_A_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // row-major
     using T_B_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
     using T_C_KQ  = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major
-    using T_A_VKQ = tile<32,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // row-major
+    // The FP32 accumulator uses the same 16x16x16 WMMA shape that DV == 80 / 112 already use.
+    using T_A_VKQ = std::conditional_t<acc_f32,
+        tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>,
+        tile<32,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>>;            // row-major
     using T_B_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
-    using T_C_VKQ = tile<16, 16, half2, DATA_LAYOUT_I_MAJOR>;          // column-major
+    using T_C_VKQ = std::conditional_t<acc_f32,
+        tile<16, 16, float, DATA_LAYOUT_I_MAJOR>,
+        tile<16, 16, half2, DATA_LAYOUT_I_MAJOR>>;                     // column-major
 };
-template<int ncols> struct mma_tile_sizes<80, ncols> {
+template<int ncols, bool acc_f32> struct mma_tile_sizes<80, ncols, acc_f32> {
     using T_A_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // row-major
     using T_B_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
     using T_C_KQ  = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major
     using T_A_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // row-major
     using T_B_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
-    using T_C_VKQ = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major
+    using T_C_VKQ = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major (always FP32)
 };
-template<int ncols> struct mma_tile_sizes<112, ncols> {
+template<int ncols, bool acc_f32> struct mma_tile_sizes<112, ncols, acc_f32> {
     using T_A_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // row-major
     using T_B_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
     using T_C_KQ  = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major
     using T_A_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // row-major
     using T_B_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
-    using T_C_VKQ = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major
+    using T_C_VKQ = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major (always FP32)
 };
 #else
-template<int DV, int ncols> struct mma_tile_sizes {
+template<int DV, int ncols, bool acc_f32> struct mma_tile_sizes {
     using T_A_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR>;           // row-major
     using T_B_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR>;           // column-major
     using T_C_KQ  = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;           // column-major
-    using T_A_VKQ = tile<32,  8, half2, DATA_LAYOUT_I_MAJOR>;           // row-major
+    using T_A_VKQ = std::conditional_t<acc_f32,
+        tile<16,  8, half2, DATA_LAYOUT_I_MAJOR>,
+        tile<32,  8, half2, DATA_LAYOUT_I_MAJOR>>;                      // row-major
     using T_B_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR>;           // column-major
-    using T_C_VKQ = tile<16, 16, half2, DATA_LAYOUT_I_MAJOR_SCRAMBLED>; // column-major
+    using T_C_VKQ = std::conditional_t<acc_f32,
+        tile<16, 16, float, DATA_LAYOUT_I_MAJOR>,
+        tile<16, 16, half2, DATA_LAYOUT_I_MAJOR_SCRAMBLED>>;            // column-major
 };
-template<int ncols> struct mma_tile_sizes<80, ncols> {
+template<int ncols, bool acc_f32> struct mma_tile_sizes<80, ncols, acc_f32> {
     using T_A_KQ  = tile<16,  8, half2>; // row-major
     using T_B_KQ  = tile<16,  8, half2>; // column-major
     using T_C_KQ  = tile<16, 16, float>; // column-major
     using T_A_VKQ = tile<16,  8, half2>; // row-major
     using T_B_VKQ = tile<16,  8, half2>; // column-major
-    using T_C_VKQ = tile<16,  8, half2>; // column-major
+    using T_C_VKQ = std::conditional_t<acc_f32, tile<16, 16, float>, tile<16, 8, half2>>; // column-major
 };
-template<int ncols> struct mma_tile_sizes<112, ncols> {
+template<int ncols, bool acc_f32> struct mma_tile_sizes<112, ncols, acc_f32> {
     using T_A_KQ  = tile<16,  8, half2>; // row-major
     using T_B_KQ  = tile<16,  8, half2>; // column-major
     using T_C_KQ  = tile<16, 16, float>; // column-major
     using T_A_VKQ = tile<16,  8, half2>; // row-major
     using T_B_VKQ = tile<16,  8, half2>; // column-major
-    using T_C_VKQ = tile<16,  8, half2>; // column-major
+    using T_C_VKQ = std::conditional_t<acc_f32, tile<16, 16, float>, tile<16, 8, half2>>; // column-major
 };
 #endif // RDNA3
 #elif defined(AMD_MFMA_AVAILABLE)
-template<int DV, int ncols> struct mma_tile_sizes {
+template<int DV, int ncols, bool acc_f32> struct mma_tile_sizes {
     using T_A_KQ  = tile<16,  8, half2>; // row-major
     using T_B_KQ  = tile<16,  8, half2>; // column-major
     using T_C_KQ  = tile<16, 16, float>; // column-major
     using T_A_VKQ = tile<16,  8, half2>; // row-major
     using T_B_VKQ = tile<16,  8, half2>; // column-major
-    using T_C_VKQ = tile<16,  8, half2>; // column-major
+    using T_C_VKQ = std::conditional_t<acc_f32, tile<16, 16, float>, tile<16, 8, half2>>; // column-major
 };
 #else // Volta
-template<int DV, int ncols> struct mma_tile_sizes {
+template<int DV, int ncols, bool acc_f32> struct mma_tile_sizes {
     using T_A_KQ  = tile< 8,  4, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // row-major
     using T_B_KQ  = tile<32,  4, half2, DATA_LAYOUT_I_MAJOR>;          // column-major
     using T_C_KQ  = tile<32,  8, float, DATA_LAYOUT_I_MAJOR>;          // column-major
@@ -1113,7 +1130,22 @@ template<int DV, int ncols> struct mma_tile_sizes {
 };
 #endif // defined(TURING_MMA_AVAILABLE)
 
-template<int DKQ, int DV, int ncols1, int ncols2, int nwarps, bool use_logit_softcap, bool V_is_K_view, bool needs_fixup, bool is_fixup>
+// True where the MMA kernel body implements an FP32 VKQ accumulator (see mma_tile_sizes).
+static bool ggml_cuda_fattn_mma_f32_acc_supported(const int cc) {
+    return amd_wmma_available(cc) || amd_mfma_available(cc);
+}
+
+// `inline` (not `static`) so the once_flag is shared across all translation units.
+inline void ggml_cuda_fattn_mma_warn_no_f32_acc() {
+    static std::once_flag flag;
+    std::call_once(flag, []() {
+        GGML_LOG_WARN("ggml_cuda_flash_attn_ext: GGML_PREC_F32 was requested, but the mma FlashAttention "
+            "kernel only implements an FP16 VKQ accumulator on this architecture. Results will be "
+            "biased low, increasingly so with context length.\n");
+    });
+}
+
+template<int DKQ, int DV, int ncols1, int ncols2, int nwarps, bool use_logit_softcap, bool V_is_K_view, bool needs_fixup, bool is_fixup, bool acc_f32>
 static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const float2 * const __restrict__ Q_f2,
         const half2  * const __restrict__ K_h2,
@@ -1143,12 +1175,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int ncols = ncols1 * ncols2;
-    using     T_A_KQ    = typename mma_tile_sizes<DV, ncols>::T_A_KQ;
-    using     T_B_KQ    = typename mma_tile_sizes<DV, ncols>::T_B_KQ;
-    using     T_C_KQ    = typename mma_tile_sizes<DV, ncols>::T_C_KQ;
-    using     T_A_VKQ   = typename mma_tile_sizes<DV, ncols>::T_A_VKQ;
-    using     T_B_VKQ   = typename mma_tile_sizes<DV, ncols>::T_B_VKQ;
-    using     T_C_VKQ   = typename mma_tile_sizes<DV, ncols>::T_C_VKQ;
+    using     T_A_KQ    = typename mma_tile_sizes<DV, ncols, acc_f32>::T_A_KQ;
+    using     T_B_KQ    = typename mma_tile_sizes<DV, ncols, acc_f32>::T_B_KQ;
+    using     T_C_KQ    = typename mma_tile_sizes<DV, ncols, acc_f32>::T_C_KQ;
+    using     T_A_VKQ   = typename mma_tile_sizes<DV, ncols, acc_f32>::T_A_VKQ;
+    using     T_B_VKQ   = typename mma_tile_sizes<DV, ncols, acc_f32>::T_B_VKQ;
+    using     T_C_VKQ   = typename mma_tile_sizes<DV, ncols, acc_f32>::T_C_VKQ;
 
     constexpr int  cols_per_warp   = T_B_KQ::I;
     constexpr int  cols_per_thread = get_cols_per_thread();
@@ -1179,14 +1211,16 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     half  * tile_mask = (half *) (nstages > 1 ? tile_V + nbatch_fa * stride_tile_V : tile_V + nbatch_fa * stride_tile_KV_max);
 
     T_B_KQ    Q_B[(Q_in_reg ? DKQ/(2*T_B_KQ::J) : 1)];
+    // A half2 C tile covers two values per element in the J direction, a float C tile only one.
+    // (This used to be spelled `DV % 32 != 0` on RDNA3, which was an exact proxy back when the
+    // FP32 accumulator was reachable only via the DV == 80 / 112 specializations.)
+    constexpr bool VKQ_C_is_half2 = std::is_same_v<decltype(T_C_VKQ::x), half2[T_C_VKQ::ne]>;
 #if defined(TURING_MMA_AVAILABLE)
     T_C_VKQ VKQ_C[cols_per_warp == 8 ? DV/T_C_VKQ::I : DV/(2*T_C_VKQ::J)];
-#elif defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
-    T_C_VKQ VKQ_C[DV % 32 != 0       ? DV/T_C_VKQ::J : DV/(2*T_C_VKQ::J)];
 #elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
-    T_C_VKQ VKQ_C[                                     DV/(2*T_C_VKQ::J)];
+    T_C_VKQ VKQ_C[VKQ_C_is_half2     ? DV/(2*T_C_VKQ::J) : DV/T_C_VKQ::J];
 #else // Volta
-    T_C_VKQ VKQ_C[                                     DV/(2*T_C_VKQ::J)];
+    T_C_VKQ VKQ_C[                     DV/(2*T_C_VKQ::J)];
 #endif // defined(TURING_MMA_AVAILABLE)
 
     float KQ_rowsum[cols_per_thread] = {0.0f};
@@ -1700,7 +1734,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }
 
-template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view>
+template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view, bool acc_f32>
 __launch_bounds__(ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols1*ncols2))
 static __global__ void flash_attn_ext_f16(
         const char * Q_ptr,
@@ -1744,6 +1778,15 @@ static __global__ void flash_attn_ext_f16(
         NO_DEVICE_CODE;
         return;
     }
+#if !defined(AMD_WMMA_AVAILABLE) && !defined(AMD_MFMA_AVAILABLE)
+    // Only AMD WMMA/MFMA implement an FP32 VKQ accumulator (see mma_tile_sizes). Elsewhere the
+    // acc_f32 instantiation would be a byte-for-byte duplicate of the FP16 one, and the host never
+    // launches it (ggml_cuda_fattn_mma_f32_acc_supported), so don't emit it at all.
+    if (acc_f32) {
+        NO_DEVICE_CODE;
+        return;
+    }
+#endif // !defined(AMD_WMMA_AVAILABLE) && !defined(AMD_MFMA_AVAILABLE)
 #ifdef VOLTA_MMA_AVAILABLE
     if (ncols1*ncols2 < 32) {
         NO_DEVICE_CODE;
@@ -1829,12 +1872,12 @@ static __global__ void flash_attn_ext_f16(
         constexpr bool is_fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         if (kb0_start == 0) {
             constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
-            flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup>
+            flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, acc_f32>
                 (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
         } else {
             constexpr bool needs_fixup = true; // CUDA block is missing the beginning of a tile.
-            flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup>
+            flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, acc_f32>
                 (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
         }
@@ -1875,7 +1918,7 @@ static __global__ void flash_attn_ext_f16(
 
     constexpr bool is_fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     constexpr bool needs_fixup = false;
-    flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup>
+    flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, acc_f32>
         (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
          ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
 #else
@@ -1912,6 +1955,14 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     const int warp_size_host = ggml_cuda_info().devices[ctx.device].warp_size;
     const int nwarps         = nthreads / warp_size_host;
 
+    // Honour a caller's GGML_PREC_F32 request by accumulating VKQ in FP32 where the kernel body
+    // supports it. Where it does not, say so once instead of silently downgrading to FP16.
+    const bool want_f32 = ggml_flash_attn_ext_get_prec(KQV) == GGML_PREC_F32;
+    const bool acc_f32  = want_f32 && ggml_cuda_fattn_mma_f32_acc_supported(cc);
+    if (want_f32 && !acc_f32) {
+        ggml_cuda_fattn_mma_warn_no_f32_acc();
+    }
+
     constexpr bool V_is_K_view = DKQ == 576; // Guaranteed by the kernel selection logic in fattn.cu
 
     const size_t nbytes_shared_KV_1stage = nbatch_fa            * std::max(nbatch_K2 + 4,  nbatch_V2 + 4) * sizeof(half2);
@@ -1937,7 +1988,9 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     fattn_kernel_t fattn_kernel;
     if (logit_softcap == 0.0f) {
         constexpr bool use_logit_softcap = false;
-        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view>;
+        fattn_kernel = acc_f32
+            ? flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, true>
+            : flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, false>;
 
 #if !defined(GGML_USE_MUSA)
         static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
@@ -1948,7 +2001,9 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 #endif // !defined(GGML_USE_MUSA)
     } else {
         constexpr bool use_logit_softcap = true;
-        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view>;
+        fattn_kernel = acc_f32
+            ? flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, true>
+            : flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, false>;
 
 #if !defined(GGML_USE_MUSA)
         static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
