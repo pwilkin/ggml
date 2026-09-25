@@ -3964,6 +3964,46 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+#if defined(GGML_USE_HIP)
+    if (node->op == GGML_OP_MUL && ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 &&
+            ggml_can_fuse(cgraph, i, { GGML_OP_MUL, GGML_OP_ADD })) {
+        ggml_tensor * add = cgraph->nodes[i + 1];
+        const ggml_tensor * other = add->src[0] == node ? add->src[1] : add->src[0];
+        const ggml_tensor * a = node->src[0];
+        const ggml_tensor * b = node->src[1];
+        const bool types_ok = a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 &&
+                              node->type == GGML_TYPE_F32 && other->type == GGML_TYPE_F32 &&
+                              add->type == GGML_TYPE_F32;
+        const bool head_bcast = b->ne[0] == a->ne[0] && b->ne[1] == a->ne[1] &&
+                                b->ne[2] == a->ne[2] && b->ne[3] == 1 && a->ne[3] > 1;
+        const bool row_bcast = b->ne[0] == a->ne[0] && b->ne[1] == 1 && b->ne[2] == 1 && b->ne[3] == 1 &&
+                               a->ne[1] > 1 && a->ne[2] == 1 && a->ne[3] == 1;
+        const bool shapes_ok = ggml_are_same_shape(a, node) && ggml_are_same_shape(node, add) &&
+                               ggml_are_same_shape(other, add) &&
+                               (head_bcast || row_bcast);
+        const bool layout_ok = ggml_is_contiguous(a) && ggml_is_contiguous(b) &&
+                               ggml_is_contiguous(other) && ggml_is_contiguous(add);
+        const auto overlaps = [](const ggml_tensor * x, const ggml_tensor * y) {
+            const uintptr_t x0 = (uintptr_t) x->data;
+            const uintptr_t y0 = (uintptr_t) y->data;
+            return x0 < y0 + ggml_nbytes(y) && y0 < x0 + ggml_nbytes(x);
+        };
+        // Preserve the multiply result even when its output aliases its input.
+        const bool alias_ok = add->data == other->data &&
+                              (node->data == a->data || !overlaps(node, a)) &&
+                              !overlaps(a, b) && !overlaps(node, b) &&
+                              !overlaps(add, a) && !overlaps(add, b) && !overlaps(add, node);
+        if (types_ok && shapes_ok && layout_ok &&
+                ggml_nelements(b) > 0 && ggml_nelements(add) / ggml_nelements(b) <= 65535 &&
+                ggml_nelements(b) <= std::numeric_limits<uint32_t>::max() &&
+                ggml_nelements(add) <= std::numeric_limits<uint32_t>::max() &&
+                alias_ok) {
+            ggml_cuda_op_fused_mul_add_f32(*cuda_ctx, node, add);
+            return 1;
+        }
+    }
+#endif
+
     // multi-(add or mul)
     if (node->op == GGML_OP_ADD || node->op == GGML_OP_MUL) {
         int     n_fuse = 0;

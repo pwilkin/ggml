@@ -26,6 +26,26 @@ static __device__ __forceinline__ float op_div(const float a, const float b) {
     return a / b;
 }
 
+#if defined(GGML_USE_HIP)
+template <bool mul_first>
+static __global__ void k_fused_mul_add_f32(const float * a, const float * b, const float * c,
+                                            float * mul_dst, float * dst, const uint32_t inner, const uint32_t total) {
+#pragma clang fp contract(off)
+    ggml_cuda_pdl_lc();
+    const uint32_t within = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t index  = blockIdx.y * inner + within;
+    if (within >= inner || index >= total) {
+        return;
+    }
+    ggml_cuda_pdl_sync();
+    float product = a[index] * b[within];
+    // Keep the same F32 rounding boundary as the separate multiply kernel.
+    asm volatile("" : "+v"(product));
+    mul_dst[index] = product;
+    dst[index] = mul_first ? product + c[index] : c[index] + product;
+}
+#endif
+
 template <float (*bin_op)(const float, const float),
           typename src0_t,
           typename src1_t,
@@ -445,6 +465,26 @@ void ggml_cuda_op_sub(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 void ggml_cuda_op_mul(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_mul>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
 }
+
+#if defined(GGML_USE_HIP)
+void ggml_cuda_op_fused_mul_add_f32(ggml_backend_cuda_context & ctx, const ggml_tensor * mul, ggml_tensor * add) {
+    const uint32_t inner = (uint32_t) ggml_nelements(mul->src[1]);
+    const uint32_t total = (uint32_t) ggml_nelements(add);
+    const int block_size = 256;
+    const dim3 blocks((inner + block_size - 1) / block_size, total / inner);
+    const ggml_cuda_kernel_launch_params params(blocks, block_size, 0, ctx.stream());
+    const float * a = (const float *) mul->src[0]->data;
+    const float * b = (const float *) mul->src[1]->data;
+    const float * c = (const float *) (add->src[0] == mul ? add->src[1]->data : add->src[0]->data);
+    float * mul_dst = (float *) mul->data;
+    float * dst = (float *) add->data;
+    if (add->src[0] == mul) {
+        ggml_cuda_kernel_launch(k_fused_mul_add_f32<true>, params, a, b, c, mul_dst, dst, inner, total);
+    } else {
+        ggml_cuda_kernel_launch(k_fused_mul_add_f32<false>, params, a, b, c, mul_dst, dst, inner, total);
+    }
+}
+#endif
 
 void ggml_cuda_op_div(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_div>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
