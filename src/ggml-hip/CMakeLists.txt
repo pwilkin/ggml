@@ -87,6 +87,16 @@ ggml_add_backend_library(ggml-hip
                          ${GGML_SOURCES_ROCM}
                         )
 
+option(GGML_HIP_CK_TILE_FMHA "Use CK Tile FMHA for gfx1151 full-sequence attention" OFF)
+if (GGML_HIP_CK_TILE_FMHA)
+    if (NOT CMAKE_HIP_ARCHITECTURES STREQUAL "gfx1151")
+        message(FATAL_ERROR "GGML_HIP_CK_TILE_FMHA requires a gfx1151-only HIP build")
+    endif()
+    find_path(CK_TILE_INCLUDE_DIR ck_tile/ops/fmha_fwd.hpp HINTS "${ROCM_PATH}/include" REQUIRED)
+    target_include_directories(ggml-hip PRIVATE "${CK_TILE_INCLUDE_DIR}")
+    target_compile_definitions(ggml-hip PRIVATE GGML_HIP_CK_TILE_FMHA)
+endif()
+
 # TODO: do not use CUDA definitions for HIP
 if (NOT GGML_BACKEND_DL)
     target_compile_definitions(ggml PUBLIC GGML_USE_CUDA)

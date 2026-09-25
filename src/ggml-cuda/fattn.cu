@@ -4,6 +4,9 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_CK_TILE_FMHA)
+#include "fattn-ck-tile.cuh"
+#endif
 
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -569,6 +572,12 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_CK_TILE_FMHA)
+    if (ggml_cuda_flash_attn_ext_ck_tile_eligible(ggml_cuda_info().devices[ctx.device].cc, dst)) {
+        ggml_cuda_flash_attn_ext_ck_tile(ctx, dst);
+        return;
+    }
+#endif
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
