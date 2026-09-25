@@ -8,7 +8,30 @@ static  __global__ void im2col_kernel(
         const float * x, T * dst,
         int64_t IC, int64_t IW, int64_t IH, int64_t OH, int64_t OW, int64_t KW, int64_t KH,
         int64_t IC_IH_IW, int64_t IH_IW, int64_t N_OH, int64_t KH_KW, int64_t IC_KH_KW,
-        int s0, int s1, int p0, int p1, int d0, int d1) {
+        int s0, int s1, int p0, int p1, int d0, int d1, bool fast_3x3) {
+    if (fast_3x3) {
+        const uint32_t pixels_per_block = OW >= 1024 ? 8 : OW >= 256 ? 2 : 1;
+        for (uint32_t i = threadIdx.x; i < uint32_t(IC_KH_KW); i += blockDim.x) {
+            const uint32_t c = i / 9;
+            const uint32_t rem = i - c*9;
+            const uint32_t ky = rem / 3;
+            const uint32_t kx = rem - ky*3;
+            const int32_t iy = int32_t(blockIdx.z) + int32_t(ky) - 1;
+            for (uint32_t px = 0; px < pixels_per_block; ++px) {
+                const uint32_t iow = blockIdx.y*pixels_per_block + px;
+                if (iow >= uint32_t(OW)) break;
+                const uint32_t out = (blockIdx.z*uint32_t(OW) + iow)*uint32_t(IC_KH_KW) + i;
+                const int32_t ix = int32_t(iow) + int32_t(kx) - 1;
+                if ((uint32_t)ix >= uint32_t(IW) || (uint32_t)iy >= uint32_t(IH)) {
+                    dst[out] = 0.0f;
+                } else {
+                    const uint32_t src = (c*uint32_t(IH) + uint32_t(iy))*uint32_t(IW) + uint32_t(ix);
+                    dst[out] = x[src];
+                }
+            }
+        }
+        return;
+    }
     const int64_t i = threadIdx.x + blockIdx.x * blockDim.x;
     if (i >= IC_KH_KW) {
         return;
@@ -53,10 +76,20 @@ static void im2col_cuda(const float * x, T* dst,
     const int64_t num_blocks = (IC_KH_KW + CUDA_IM2COL_BLOCK_SIZE - 1) / CUDA_IM2COL_BLOCK_SIZE;
     const int64_t N_OH = N * OH;
     const int64_t KH_KW = KW*KH;
-    dim3 block_nums(num_blocks, MIN(OW, MAX_GRIDDIM_Y), MIN(N_OH, MAX_GRIDDIM_Z));
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const bool fast_3x3 = GGML_CUDA_CC_IS_RDNA3_5(cc) &&
+        KW == 3 && KH == 3 && KH_KW == 9 && IC_KH_KW == 9*IC &&
+        s0 == 1 && s1 == 1 && p0 == 1 && p1 == 1 && d0 == 1 && d1 == 1 &&
+        OW == IW && OH == IH && N == 1 && IC_IH_IW == IW*IH &&
+        OW <= MAX_GRIDDIM_Y && OH <= MAX_GRIDDIM_Z &&
+        uint64_t(IC_KH_KW)*uint64_t(OW)*uint64_t(OH) <= UINT32_MAX;
+    const int64_t pixels_per_block = OW >= 1024 ? 8 : OW >= 256 ? 2 : 1;
+    dim3 block_nums(fast_3x3 ? 1 : num_blocks,
+                    fast_3x3 ? (OW + pixels_per_block - 1)/pixels_per_block : MIN(OW, MAX_GRIDDIM_Y),
+                    MIN(N_OH, MAX_GRIDDIM_Z));
     im2col_kernel<<<block_nums, MIN(IC_KH_KW, CUDA_IM2COL_BLOCK_SIZE) , 0, stream>>>(x, dst, IC, IW, IH, OH, OW, KW, KH,
                                                                                      IC_IH_IW, IH_IW, N_OH, KH_KW, IC_KH_KW,
-                                                                                     s0, s1, p0, p1, d0, d1);
+                                                                                     s0, s1, p0, p1, d0, d1, fast_3x3);
 }
 
 static void im2col_cuda_f16(const float * x, half * dst,

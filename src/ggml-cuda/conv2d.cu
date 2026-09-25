@@ -130,7 +130,12 @@ static __global__ void conv2d_implicit_gemm_f16(const half* __restrict__ input,
     using namespace ggml_cuda_mma;
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nthreads  = 4 * warp_size;
-    constexpr int BM = 64, BN = 64, BK = 64;
+    constexpr int BM = 64, BN = 64;
+#if defined(__gfx1151__)
+    constexpr int BK = 32;
+#else
+    constexpr int BK = 64;
+#endif
     constexpr int AS = BK / 2 + 4;
     constexpr int BS = BN / 2 + 4;
     __shared__ __align__(16) half2 a_s[BM][AS];

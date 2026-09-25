@@ -42,6 +42,43 @@ static __global__ void cpy_scalar(const char * cx, char * cdst, const int64_t ne
     cpy_1(cx + x_offset, cdst + dst_offset);
 }
 
+static __global__ void cpy_f32_deinterleave2(const int4 * src, int2 * dst, const int64_t nvec) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nvec) {
+        return;
+    }
+    ggml_cuda_pdl_sync();
+    const int4 v = src[i];
+    dst[i] = make_int2(v.x, v.z);
+    dst[i + nvec] = make_int2(v.y, v.w);
+}
+
+static __global__ void cpy_f32_sequence_head_transpose128(const int4 * src, int4 * dst,
+                                                           const int64_t sequence, const int64_t heads) {
+    ggml_cuda_pdl_lc();
+    __shared__ int4 tile[4 * 8 * 32];
+    const int tid = threadIdx.x;
+    const int64_t s0 = (int64_t)blockIdx.x * 4;
+    const int64_t h0 = (int64_t)blockIdx.y * 8;
+    ggml_cuda_pdl_sync();
+    for (int j = 0; j < 4; ++j) {
+        const int i = tid + 256 * j;
+        const int s = i / (8 * 32), h = i / 32 % 8, d = i % 32;
+        if (s0 + s < sequence && h0 + h < heads) {
+            tile[i] = src[((s0 + s) * heads + h0 + h) * 32 + d];
+        }
+    }
+    __syncthreads();
+    for (int j = 0; j < 4; ++j) {
+        const int i = tid + 256 * j;
+        const int h = i / (4 * 32), s = i / 32 % 4, d = i % 32;
+        if (s0 + s < sequence && h0 + h < heads) {
+            dst[((h0 + h) * sequence + s0 + s) * 32 + d] = tile[s * 8 * 32 + h * 32 + d];
+        }
+    }
+}
+
 template <typename T>
 static __global__ void cpy_scalar_transpose(const char * cx, char * cdst, const int64_t ne,
                                const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
@@ -510,9 +547,51 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
         }
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
-        if (can_be_transposed) {
+        const int64_t pixels = ne00 * ne01;
+        const int64_t channels = src0->ne[3];
+        const bool interleaved_to_planar = ne02 == 1 && ne12 == 1 && ne00 == ne10 && ne01 == ne11 &&
+            channels > 1 && nb03 == sizeof(float) && nb00 == channels * sizeof(float) &&
+            nb01 == ne00 * nb00 && nb02 >= nb00 &&
+            nb10 == sizeof(float) && nb11 == ne10 * nb10 && nb13 == pixels * sizeof(float);
+        const bool deinterleave2 = src0->ne[3] == 2 && ne % 4 == 0 && ne <= INT_MAX &&
+            ne00 == ne10 && ne01 == ne11 && ne02 == ne12 &&
+            nb00 == 2 * sizeof(float) && nb01 == ne00 * nb00 && nb02 == ne01 * nb01 && nb03 == sizeof(float) &&
+            nb10 == sizeof(float) && nb11 == ne10 * nb10 && nb12 == ne11 * nb11 && nb13 == ne12 * nb12 &&
+            (reinterpret_cast<uintptr_t>(src0_ddc) % alignof(int4)) == 0 &&
+            (reinterpret_cast<uintptr_t>(src1_ddc) % alignof(int4)) == 0;
+        const bool sequence_head_transpose128 = src0->ne[3] == 1 && ne00 == 128 && ne02 > 1 &&
+            ne01 <= INT_MAX && ne02 <= INT_MAX &&
+            ne00 == ne10 && ne01 == ne11 && ne02 == ne12 &&
+            nb00 == sizeof(float) && nb02 == ne00 * nb00 && nb01 == ne02 * nb02 &&
+            nb10 == sizeof(float) && nb11 == ne10 * nb10 && nb12 == ne11 * nb11 &&
+            (reinterpret_cast<uintptr_t>(src0_ddc) % alignof(int4)) == 0 &&
+            (reinterpret_cast<uintptr_t>(src1_ddc) % alignof(int4)) == 0;
+        const int64_t spatial = ne01 * ne02;
+        const bool planar_to_interleaved = src0->ne[3] == 1 && ne00 > 1 &&
+            ne00 == ne10 && ne01 == ne11 && ne02 == ne12 &&
+            nb00 == spatial * sizeof(float) && nb01 == sizeof(float) && nb02 == ne01 * nb01 &&
+            nb10 == sizeof(float) && nb11 == ne10 * nb10 && nb12 == ne11 * nb11 && nb13 == ne12 * nb12;
+        if (deinterleave2) {
+            const int64_t nvec = ne / 4;
+            const dim3 grid((nvec + 255) / 256);
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid, dim3(256), 0, main_stream);
+            ggml_cuda_kernel_launch(cpy_f32_deinterleave2, launch_params,
+                (const int4 *)src0_ddc, (int2 *)src1_ddc, nvec);
+        } else if (sequence_head_transpose128) {
+            const dim3 grid((ne01 + 3) / 4, (ne02 + 7) / 8);
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid, dim3(256), 0, main_stream);
+            ggml_cuda_kernel_launch(cpy_f32_sequence_head_transpose128, launch_params,
+                (const int4 *)src0_ddc, (int4 *)src1_ddc, ne01, ne02);
+        } else if (can_be_transposed) {
             ggml_cpy_scalar_cuda<float, float, true>
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+        } else if (interleaved_to_planar) {
+            // The dense interleaved and planar 4D views form one 2D transpose.
+            ggml_cpy_scalar_cuda<float, float, true>
+                (src0_ddc, src1_ddc, ne, pixels, channels, 1, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+        } else if (planar_to_interleaved) {
+            ggml_cpy_scalar_cuda<float, float, true>
+                (src0_ddc, src1_ddc, ne, ne00, spatial, 1, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
         } else {
             ggml_cpy_scalar_cuda<float, float>
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
