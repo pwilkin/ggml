@@ -580,9 +580,13 @@ void quantize_mmq_q8_1_cuda(
     GGML_ASSERT(ne0 % QK8_1_MMQ == 0);
 
     // ne1 tends to assume the highest values, therefore use it as the "x" dimension of the CUDA grid:
-    const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const bool use_256_threads = GGML_CUDA_CC_IS_RDNA3_5(cc) && type_src0 == GGML_TYPE_Q8_0 &&
+                                 ne0 >= 1024 && ne0 % 1024 == 0;
+    const int q8_block_size = use_256_threads ? 256 : CUDA_QUANTIZE_BLOCK_SIZE_MMQ;
+    const int64_t block_num_y = (ne0 + 4*q8_block_size - 1) / (4*q8_block_size);
     const dim3 num_blocks(ne1, block_num_y, ne2*ne3);
-    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    const dim3 block_size(q8_block_size, 1, 1);
     switch (mmq_get_q8_1_ds_layout(type_src0)) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false>

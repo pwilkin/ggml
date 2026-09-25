@@ -902,11 +902,22 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
         {
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+#if defined(__gfx1151__)
+            if constexpr (type == GGML_TYPE_Q8_0 && J == 128 && !fallback) {
 #pragma unroll
-            for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
-                int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+                for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size * 2) {
+                    const int l = l0 + (threadIdx.y * warp_size + threadIdx.x) * 2;
+                    ggml_cuda_memcpy_1<8>(tile_y + l, by0 + l);
+                }
+            } else
+#endif
+            {
+#pragma unroll
+                for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                    int l = l0 + threadIdx.y*warp_size + threadIdx.x;
 
-                tile_y[l] = by0[l];
+                    tile_y[l] = by0[l];
+                }
             }
         }
 
@@ -918,11 +929,22 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
         {
             const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
+#if defined(__gfx1151__)
+            if constexpr (type == GGML_TYPE_Q8_0 && J == 128 && !fallback) {
 #pragma unroll
-            for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
-                int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+                for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size * 2) {
+                    const int l = l0 + (threadIdx.y * warp_size + threadIdx.x) * 2;
+                    ggml_cuda_memcpy_1<8>(tile_y + l, by0 + l);
+                }
+            } else
+#endif
+            {
+#pragma unroll
+                for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                    int l = l0 + threadIdx.y*warp_size + threadIdx.x;
 
-                tile_y[l] = by0[l];
+                    tile_y[l] = by0[l];
+                }
             }
         }
 
@@ -987,8 +1009,13 @@ static __global__ void mul_mat_q(
         const uint2 tmp2 = fast_div_modulo(blockIdx.z, nchannels_y);
         const int wt = tmp2.x;
         const int zt = tmp2.y;
-        const int jt = blockIdx.y;
-        const int it = blockIdx.x;
+#if defined(__gfx1151__)
+        constexpr bool swap_axes = type == GGML_TYPE_Q8_0 && J == 128 && !fallback;
+#else
+        constexpr bool swap_axes = false;
+#endif
+        const int jt = swap_axes ? blockIdx.x : blockIdx.y;
+        const int it = swap_axes ? blockIdx.y : blockIdx.x;
 
         // Defaults for regular matrix multiplication:
         int col_low    = 0;
@@ -1404,7 +1431,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int nty  = (args.nrows_x   + config.I - 1) / config.I;
     const int ntx  = (args.ncols_max + config.J - 1) / config.J;
     const int ntzw = args.nchannels_y * args.nsamples_y;
-    const dim3 block_nums_xy_tiling(nty, ntx, ntzw);
+    const bool swap_axes = type == GGML_TYPE_Q8_0 && J == 128 && !fallback && cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151;
+    const dim3 block_nums_xy_tiling(swap_axes ? ntx : nty, swap_axes ? nty : ntx, ntzw);
 
     GGML_ASSERT(args.nchannels_y % args.nchannels_x == 0);
     GGML_ASSERT(args.nsamples_y  % args.nsamples_x  == 0);
