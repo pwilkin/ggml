@@ -844,7 +844,12 @@ static __global__ void flash_attn_tile(
     constexpr int warp_size = 32;
     constexpr int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, ncols1*ncols2) / warp_size;
     constexpr int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, ncols1*ncols2);
+#if defined(__gfx1151__)
+    constexpr int nbatch_K  = DKQ == 128 && DV == 128 && ncols1 == 64 && ncols2 == 1 ? 128 :
+                              ggml_cuda_fattn_tile_get_nbatch_K(DKQ, DV, ncols1*ncols2);
+#else
     constexpr int nbatch_K  = ggml_cuda_fattn_tile_get_nbatch_K (DKQ, DV, ncols1*ncols2);
+#endif
 
     // In this kernel Q, K, V are matrices while i, j, k are matrix indices.
 
