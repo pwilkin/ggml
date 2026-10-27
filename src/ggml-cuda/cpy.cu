@@ -213,8 +213,17 @@ static void ggml_cpy_scalar_cuda(
         const int64_t num_blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
         GGML_ASSERT(num_blocks <= INT_MAX);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream);
-        ggml_cuda_kernel_launch(cpy_scalar<cpy_1_scalar<src_t, dst_t>>, launch_params,
-            cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+        // Walking a source with dims 1 and 2 swapped (e.g. ggml_cont(ggml_permute(x, 0, 2, 1, 3))) in
+        // destination order reads it one dim-1 stride apart, several times below DRAM bandwidth.
+        // For same-shape copies the walk order is free, so swap dims 1 and 2 on both sides to follow the source.
+        const bool swap_12 = ne00 == ne10 && ne01 == ne11 && ne02 == ne12 && nb02 < nb01 && nb11 <= nb12;
+        if (swap_12) {
+            ggml_cuda_kernel_launch(cpy_scalar<cpy_1_scalar<src_t, dst_t>>, launch_params,
+                cx, cdst, ne, ne00, ne02, ne01, nb00, nb02, nb01, nb03, ne10, ne12, ne11, nb10, nb12, nb11, nb13);
+        } else {
+            ggml_cuda_kernel_launch(cpy_scalar<cpy_1_scalar<src_t, dst_t>>, launch_params,
+                cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+        }
     };
 
     if (transposed) {

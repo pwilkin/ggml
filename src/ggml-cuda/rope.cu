@@ -8,7 +8,7 @@ struct RopeApplyStrides {
     int64_t pe[4];
 };
 
-template<bool interleaved>
+template<bool interleaved, bool heads_inner>
 static __global__ void rope_apply_f32(
         const float * x, const float * pe, float * dst,
         int64_t half_dim, int64_t heads, int64_t tokens, int64_t pairs,
@@ -18,10 +18,11 @@ static __global__ void rope_apply_f32(
         return;
     }
     const int64_t j     = index % half_dim;
-    const int64_t row   = index / half_dim;
-    const int64_t token = row % tokens;
-    const int64_t head  = (row / tokens) % heads;
-    const int64_t batch = row / (tokens*heads);
+    const int64_t r     = index / half_dim;
+    const int64_t token = heads_inner ? (r / heads) % tokens : r % tokens;
+    const int64_t head  = heads_inner ? r % heads : (r / tokens) % heads;
+    const int64_t batch = r / (tokens*heads);
+    const int64_t row   = (batch*heads + head)*tokens + token;
     const int64_t i0    = interleaved ? 2*j : j;
     const int64_t i1    = interleaved ? 2*j + 1 : j + half_dim;
     const float * x_row = x + head*strides.x[1] + token*strides.x[2] + batch*strides.x[3];
@@ -55,15 +56,15 @@ void ggml_cuda_op_rope_apply(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     const dim3 blocks((pairs + CUDA_ROPE_BLOCK_SIZE - 1)/CUDA_ROPE_BLOCK_SIZE);
     const dim3 threads(CUDA_ROPE_BLOCK_SIZE);
     const ggml_cuda_kernel_launch_params launch_params = {blocks, threads, 0, ctx.stream()};
-    if (ggml_get_op_params_i32(dst, 0)) {
-        ggml_cuda_kernel_launch(rope_apply_f32<true>, launch_params,
-            (const float *) x->data, (const float *) pe->data, (float *) dst->data,
-            x->ne[0]/2, x->ne[1], x->ne[2], pairs, strides);
-    } else {
-        ggml_cuda_kernel_launch(rope_apply_f32<false>, launch_params,
-            (const float *) x->data, (const float *) pe->data, (float *) dst->data,
-            x->ne[0]/2, x->ne[1], x->ne[2], pairs, strides);
-    }
+    const bool interleaved = ggml_get_op_params_i32(dst, 0) != 0;
+    // dst swaps the head and token axes of x. Visiting rows in dst order when x keeps the heads of a
+    // token together reads ne0-wide pieces one token stride apart, at a fraction of DRAM bandwidth.
+    const bool heads_inner = x->nb[1] < x->nb[2];
+    const auto kernel = interleaved ? (heads_inner ? rope_apply_f32<true, true>  : rope_apply_f32<true, false>)
+                                    : (heads_inner ? rope_apply_f32<false, true> : rope_apply_f32<false, false>);
+    ggml_cuda_kernel_launch(kernel, launch_params,
+        (const float *) x->data, (const float *) pe->data, (float *) dst->data,
+        x->ne[0]/2, x->ne[1], x->ne[2], pairs, strides);
 }
 
 struct rope_corr_dims {
